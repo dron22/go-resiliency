@@ -2,9 +2,13 @@
 package retrier
 
 import (
+	"errors"
 	"math/rand"
 	"time"
 )
+
+// ErrStopped is the error returned from Run when the retry procedure is stopped
+var ErrStopped = errors.New("retry procedure stopped")
 
 // Retrier implements the "retriable" resiliency pattern, abstracting out the process of retrying a failed action
 // a certain number of times with an optional back-off between each retry.
@@ -36,22 +40,38 @@ func New(backoff []time.Duration, class Classifier) *Retrier {
 // returned to the caller. If the result is Retry, then Run sleeps according to the its backoff policy
 // before retrying. If the total number of retries is exceeded then the return value of the work function
 // is returned to the caller regardless.
-func (r *Retrier) Run(work func() error) error {
-	retries := 0
-	for {
-		ret := work()
+func (r *Retrier) Run(work func() error) (<-chan error, chan<- bool) {
+	result := make(chan error)
+	quit := make(chan bool)
 
-		switch r.class.Classify(ret) {
-		case Succeed, Fail:
-			return ret
-		case Retry:
-			if retries >= len(r.backoff) {
-				return ret
+	go func() {
+		defer close(result)
+
+		retries := 0
+		for {
+			ret := work()
+
+			switch r.class.Classify(ret) {
+			case Succeed, Fail:
+				result <- ret
+				return
+			case Retry:
+				if retries >= len(r.backoff) {
+					result <- ret
+					return
+				}
+				select {
+				case <-quit:
+					result <- ErrStopped
+					return
+				case <-time.After(r.calcSleep(retries)):
+					retries++
+				}
 			}
-			time.Sleep(r.calcSleep(retries))
-			retries++
 		}
-	}
+	}()
+
+	return result, quit
 }
 
 func (r *Retrier) calcSleep(i int) time.Duration {
